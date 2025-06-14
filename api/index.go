@@ -1,4 +1,4 @@
-package main
+package handler
 
 import (
 	"context"
@@ -455,15 +455,20 @@ func updateState() {
 	stateCache = state
 }
 
+func helloHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "<h1>Hello, World!</h1>")
+}
+
 // ===== MAIN =====
-func main() {
-	
+// Handler for Vercel serverless function
+func Handler(w http.ResponseWriter, r *http.Request) {
 	initRedis()
 	mux := http.NewServeMux()
 
 	// Public
 	mux.HandleFunc("/api/login", loginHandler)
 	mux.HandleFunc("/api/poll", pollHandler)
+	mux.HandleFunc("/", helloHandler)
 
 	// Admin
 	mux.HandleFunc("/api/admin/create", authMiddleware(createCounter, RoleAdmin))
@@ -474,7 +479,7 @@ func main() {
 	// Counter
 	mux.HandleFunc("/api/counter/increment", authMiddleware(incrementCounter, RoleCounter))
 
-
-	fmt.Println("Server running on http://localhost:4000")
-	log.Fatal(http.ListenAndServe(":4000", corsMiddleware(mux)))
+	// Serve the request using the CORS middleware
+	corsMiddleware(mux).ServeHTTP(w, r)
 }
+
