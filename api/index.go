@@ -49,14 +49,14 @@ type Claims struct {
 
 // Initialize Redis client
 func initRedis() {
-    redisURL := os.Getenv("REDIS_URL")
+    redisURL := os.Getenv("MY_REDIS_URL")
     if redisURL == "" {
-        log.Fatal("REDIS_URL must be set in .env")
+        log.Fatal("MY_REDIS_URL must be set in .env")
     }
 
     opts, err := redis.ParseURL(redisURL)
     if err != nil {
-        log.Fatalf("Failed to parse REDIS_URL: %v", err)
+        log.Fatalf("Failed to parse MY_REDIS_URL: %v", err)
     }
 
     redisClient = redis.NewClient(opts)
@@ -84,6 +84,8 @@ func initRedis() {
             log.Fatalf("Failed to set admin: %v", err)
         }
     }
+
+	updateState()
 }
 
 // ===== CORS Middleware =====
@@ -209,8 +211,15 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
         Value:    signed,
         Path:     "/",
         HttpOnly: true,
+        SameSite: http.SameSiteLaxMode,
+    })
+	http.SetCookie(w, &http.Cookie{
+        Name:     "auth_token",
+        Value:    signed,
+        Path:     "/",
+        HttpOnly: true,
         SameSite: http.SameSiteNoneMode,
-        Secure:   true,
+		Secure: true,
     })
 
     json.NewEncoder(w).Encode(map[string]string{"message": "login success", "role": claims.Role})
@@ -408,56 +417,98 @@ func incrementCounter(w http.ResponseWriter, r *http.Request) {
 
 
 // ===== Long Polling Handler =====
-func pollHandler(w http.ResponseWriter, r *http.Request) {
-	lastVersion, _ := time.Parse(time.RFC3339Nano, r.URL.Query().Get("version"))
-	timeout := time.After(30 * time.Second)
-
-	for {
-		select {
-		case <-timeout:
-			counters := make(map[string]*Counter)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"version": time.Unix(0, stateVersion).Format(time.RFC3339Nano),
-				"state":   counters,
-			})
-			return
-		default:
-			currentTime := time.Unix(0, stateVersion)
-			if lastVersion.Before(currentTime) {
-				counters := make(map[string]*Counter)
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"version": currentTime.Format(time.RFC3339Nano),
-					"state":   counters,
-				})
-				return
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-}
-
 func updateState() {
-	stateVersion = time.Now().UnixNano()
-	keys, _ := redisClient.Keys(ctx, "counter:*").Result()
-	counters := make(map[string]*Counter)
-	for _, key := range keys {
-		userJSON, err := redisClient.Get(ctx, key).Result()
-		if err == nil {
-			var counter Counter
-			if err := json.Unmarshal([]byte(userJSON), &counter); err == nil {
-				counters[counter.Username] = &counter
-			}
-		}
-	}
-	state, _ := json.Marshal(counters)
-	stateCache = state
+    log.Println("updateState: Starting state update")
+    stateVersion = time.Now().UnixNano()
+    keys, err := redisClient.Keys(ctx, "counter:*").Result()
+    if err != nil {
+        log.Printf("updateState: Error fetching keys from Redis: %v", err)
+    }
+    log.Printf("updateState: Retrieved keys: %v", keys)
+    counters := make(map[string]*Counter)
+    for _, key := range keys {
+        userJSON, err := redisClient.Get(ctx, key).Result()
+        if err != nil {
+            log.Printf("updateState: Error fetching key %s: %v", key, err)
+            continue
+        }
+        var counter Counter
+        if err := json.Unmarshal([]byte(userJSON), &counter); err != nil {
+            log.Printf("updateState: Error unmarshaling JSON for key %s: %v", key, err)
+            continue
+        }
+        counters[counter.Username] = &counter
+    }
+    state, err := json.Marshal(counters)
+    if err != nil {
+        log.Printf("updateState: Error marshaling counters to JSON: %v", err)
+    }
+    stateCache = state
+    log.Printf("updateState: Updated stateCache with %d counters", len(counters))
 }
 
-func helloHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "<h1>Hello, World!</h1>")
+func pollHandler(w http.ResponseWriter, r *http.Request) {
+    versionQuery := r.URL.Query().Get("version")
+    log.Printf("pollHandler: Received request with version: %s", versionQuery)
+    lastVersion, err := time.Parse(time.RFC3339Nano, versionQuery)
+    if err != nil {
+        log.Printf("pollHandler: Error parsing version '%s': %v, defaulting to zero time", versionQuery, err)
+        lastVersion = time.Time{}
+    }
+    timeout := time.After(30 * time.Second)
+
+    for {
+        select {
+        case <-timeout:
+            log.Println("pollHandler: Timeout reached")
+            w.Header().Set("Content-Type", "application/json")
+            var counters map[string]*Counter
+            log.Printf("pollHandler: stateCache size: %d bytes", len(stateCache))
+            if len(stateCache) > 0 {
+                if err := json.Unmarshal(stateCache, &counters); err != nil {
+                    log.Printf("pollHandler: Error unmarshaling stateCache: %v", err)
+                    http.Error(w, "Server error", http.StatusInternalServerError)
+                    return
+                }
+            } else {
+                counters = make(map[string]*Counter)
+                log.Println("pollHandler: stateCache is empty, returning empty counters")
+            }
+            log.Printf("pollHandler: Sending response with %d counters", len(counters))
+            json.NewEncoder(w).Encode(map[string]interface{}{
+                "version": time.Unix(0, stateVersion).Format(time.RFC3339Nano),
+                "state":   counters,
+            })
+            return
+        default:
+            currentTime := time.Unix(0, stateVersion)
+            if lastVersion.Before(currentTime) {
+                log.Printf("pollHandler: State changed, lastVersion=%v, currentTime=%v", lastVersion, currentTime)
+                w.Header().Set("Content-Type", "application/json")
+                var counters map[string]*Counter
+                log.Printf("pollHandler: stateCache size: %d bytes", len(stateCache))
+                if len(stateCache) > 0 {
+                    if err := json.Unmarshal(stateCache, &counters); err != nil {
+                        log.Printf("pollHandler: Error unmarshaling stateCache: %v", err)
+                        http.Error(w, "Server error", http.StatusInternalServerError)
+                        return
+                    }
+                } else {
+                    counters = make(map[string]*Counter)
+                    log.Println("pollHandler: stateCache is empty, returning empty counters")
+                }
+                log.Printf("pollHandler: Sending response with %d counters", len(counters))
+                json.NewEncoder(w).Encode(map[string]interface{}{
+                    "version": currentTime.Format(time.RFC3339Nano),
+                    "state":   counters,
+                })
+                return
+            }
+            time.Sleep(100 * time.Millisecond)
+        }
+    }
 }
+
 
 // ===== MAIN =====
 // Handler for Vercel serverless function
@@ -468,7 +519,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// Public
 	mux.HandleFunc("/api/login", loginHandler)
 	mux.HandleFunc("/api/poll", pollHandler)
-	mux.HandleFunc("/", helloHandler)
 
 	// Admin
 	mux.HandleFunc("/api/admin/create", authMiddleware(createCounter, RoleAdmin))
