@@ -6,13 +6,17 @@ import (
 	"log"
 	"net/http"
 	"time"
+	"os"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 )
 
-var jwtKey = []byte("secret-key") // Replace this with a secure key in production
+const ORIGIN = os.Getenv("NEXT_FRONT_END_URL")
+const JWT_KEY = os.Getenv("NEXT_JWT_KEY")
 
+
+var jwtKey = []byte(JWT_KEY) 
 // Roles
 const (
 	RoleAdmin   = "admin"
@@ -42,7 +46,7 @@ var counters = map[string]*Counter{
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Set CORS headers
-		w.Header().Set("Access-Control-Allow-Origin", "https://localhost:3000")
+		w.Header().Set("Access-Control-Allow-Origin", ORIGIN)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
