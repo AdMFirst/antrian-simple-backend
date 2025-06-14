@@ -13,7 +13,8 @@ import (
 )
 
 const ORIGIN = os.Getenv("NEXT_FRONT_END_URL")
-const JWT_KEY = os.Getenv("NEXT_JWT_KEY")
+const JWT_KEY = os.Getenv("JWT_KEY")
+const DEFAULT_PASSWORD = os.Getenv("DEFAULT_PASSWORD")
 
 
 var jwtKey = []byte(JWT_KEY) 
@@ -39,7 +40,7 @@ type Claims struct {
 
 // In-memory counter store
 var counters = map[string]*Counter{
-	"admin": {Username: "admin", Password: "admin123"},
+	"admin": {Username: "admin", Password: DEFAULT_PASSWORD},
 }
 
 // ===== CORS Middleware =====
