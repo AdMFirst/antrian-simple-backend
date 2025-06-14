@@ -8,16 +8,19 @@ import (
 	"time"
 	"os"
 
+	"github.com/joho/godotenv"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/gorilla/websocket"
 )
 
-const ORIGIN = os.Getenv("NEXT_FRONT_END_URL")
-const JWT_KEY = os.Getenv("JWT_KEY")
-const DEFAULT_PASSWORD = os.Getenv("DEFAULT_PASSWORD")
 
+var err = godotenv.Load()
 
-var jwtKey = []byte(JWT_KEY) 
+// State version for long polling
+var stateVersion int64
+var stateCache []byte
+
+var jwtKey = []byte(os.Getenv("JWT_KEY")) // Replace this with a secure key in production
+
 // Roles
 const (
 	RoleAdmin   = "admin"
@@ -40,14 +43,14 @@ type Claims struct {
 
 // In-memory counter store
 var counters = map[string]*Counter{
-	"admin": {Username: "admin", Password: DEFAULT_PASSWORD},
+	"admin": {Username: "admin", Password: os.Getenv("ADMIN_PASSWORD")},
 }
 
 // ===== CORS Middleware =====
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Set CORS headers
-		w.Header().Set("Access-Control-Allow-Origin", ORIGIN)
+		w.Header().Set("Access-Control-Allow-Origin", os.Getenv("NEXT_FRONT_END_URL"))
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
@@ -134,7 +137,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		Secure: true,
 		
 	})
-	broadcastState()
+	
 	json.NewEncoder(w).Encode(map[string]string{"message": "login success", "role": claims.Role})
 }
 
@@ -161,7 +164,7 @@ func createCounter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	counters[input.Username] = &Counter{Username: input.Username, Password: input.Password}
-	broadcastState()
+	
 	json.NewEncoder(w).Encode(map[string]string{"message": "Counter created"})
 }
 
@@ -173,7 +176,7 @@ func deleteCounter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	delete(counters, username)
-	broadcastState()
+	
 	json.NewEncoder(w).Encode(map[string]string{"message": "Counter deleted"})
 }
 
@@ -226,7 +229,7 @@ func updateCounter(w http.ResponseWriter, r *http.Request) {
 		counter.Password = input.Password
 	}
 
-	broadcastState()
+	
 	json.NewEncoder(w).Encode(map[string]string{"message": "Counter updated"})
 }
 
@@ -252,7 +255,7 @@ func incrementCounter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	counter.Count = input.Count
-	broadcastState()
+	
 	json.NewEncoder(w).Encode(map[string]int{"count": counter.Count})
 }
 
@@ -265,75 +268,53 @@ func resetCounter(w http.ResponseWriter, r *http.Request) {
 	}
 	counter.Count = 0
 	json.NewEncoder(w).Encode(map[string]int{"count": counter.Count})
-	broadcastState()
+	
 }
 
-// ===== WebSocket Broadcasting =====
+// ===== Long Polling Handler =====
+func pollHandler(w http.ResponseWriter, r *http.Request) {
+	lastVersion, _ := time.Parse(time.RFC3339Nano, r.URL.Query().Get("version"))
+	timeout := time.After(30 * time.Second)
 
-type Client chan []byte
-
-var (
-	clients   = make(map[Client]bool)
-	broadcast = make(chan []byte)
-	upgrader  = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
-	}
-)
-
-func wsHandler(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
-	client := make(Client)
-	clients[client] = true
-
-	go func() {
-		for msg := range client {
-			conn.WriteMessage(websocket.TextMessage, msg)
-		}
-	}()
-
-	defer func() {
-		delete(clients, client)
-		close(client)
-		conn.Close()
-	}()
-
-	// Passive read loop (to detect disconnects)
 	for {
-		if _, _, err := conn.ReadMessage(); err != nil {
-			break
-		}
-	}
-}
-
-func broadcaster() {
-	for {
-		msg := <-broadcast
-		for c := range clients {
-			select {
-			case c <- msg:
-			default:
-				close(c)
-				delete(clients, c)
+		select {
+		case <-timeout:
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"version": time.Unix(0, stateVersion).Format(time.RFC3339Nano),
+				"state":   counters,
+			})
+			return
+		default:
+			currentTime := time.Unix(0, stateVersion)
+			if lastVersion.Before(currentTime) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"version": currentTime.Format(time.RFC3339Nano),
+					"state":   counters,
+				})
+				return
 			}
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
 
-func broadcastState() {
+func updateState() {
+	stateVersion = time.Now().UnixNano()
 	state, _ := json.Marshal(counters)
-	broadcast <- state
+	stateCache = state
 }
 
 // ===== MAIN =====
 func main() {
+	
+
 	mux := http.NewServeMux()
 
 	// Public
 	mux.HandleFunc("/api/login", loginHandler)
-	mux.HandleFunc("/ws/counters", wsHandler)
+	mux.HandleFunc("/api/poll", pollHandler)
 
 	// Admin
 	mux.HandleFunc("/api/admin/create", authMiddleware(createCounter, RoleAdmin))
@@ -345,8 +326,6 @@ func main() {
 	mux.HandleFunc("/api/counter/increment", authMiddleware(incrementCounter, RoleCounter))
 	mux.HandleFunc("/api/counter/reset", authMiddleware(resetCounter, RoleCounter))
 
-	// Start WebSocket broadcaster
-	go broadcaster()
 
 	fmt.Println("Server running on http://localhost:4000")
 	log.Fatal(http.ListenAndServe(":4000", corsMiddleware(mux)))
