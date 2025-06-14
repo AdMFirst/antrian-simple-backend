@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/redis/go-redis/v9"
 )
 
 
@@ -20,6 +22,10 @@ var stateVersion int64
 var stateCache []byte
 
 var jwtKey = []byte(os.Getenv("JWT_KEY")) // Replace this with a secure key in production
+
+// Redis client
+var redisClient *redis.Client
+var ctx = context.Background()
 
 // Roles
 const (
@@ -41,9 +47,43 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
-// In-memory counter store
-var counters = map[string]*Counter{
-	"admin": {Username: "admin", Password: os.Getenv("ADMIN_PASSWORD")},
+// Initialize Redis client
+func initRedis() {
+    redisURL := os.Getenv("REDIS_URL")
+    if redisURL == "" {
+        log.Fatal("REDIS_URL must be set in .env")
+    }
+
+    opts, err := redis.ParseURL(redisURL)
+    if err != nil {
+        log.Fatalf("Failed to parse REDIS_URL: %v", err)
+    }
+
+    redisClient = redis.NewClient(opts)
+
+    if _, err := redisClient.Ping(ctx).Result(); err != nil {
+        log.Fatalf("Failed to connect to Redis: %v", err)
+    }
+
+    adminKey := "counter:admin"
+    exists, err := redisClient.Exists(ctx, adminKey).Result()
+    if err != nil {
+        log.Fatalf("Failed to check admin existence: %v", err)
+    }
+    if exists == 0 {
+        adminPassword := os.Getenv("ADMIN_PASSWORD")
+        if adminPassword == "" {
+            log.Fatal("ADMIN_PASSWORD must be set in .env")
+        }
+        admin := Counter{Username: "admin", Password: adminPassword}
+        adminJSON, err := json.Marshal(admin)
+        if err != nil {
+            log.Fatalf("Failed to marshal admin: %v", err)
+        }
+        if err := redisClient.Set(ctx, adminKey, adminJSON, 0).Err(); err != nil {
+            log.Fatalf("Failed to set admin: %v", err)
+        }
+    }
 }
 
 // ===== CORS Middleware =====
@@ -95,50 +135,85 @@ func authMiddleware(next http.HandlerFunc, requiredRole string) http.HandlerFunc
 }
 
 // ===== Handlers =====
-
 func loginHandler(w http.ResponseWriter, r *http.Request) {
-	var creds struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
-		return
-	}
+    var creds struct {
+        Username string `json:"username"`
+        Password string `json:"password"`
+    }
 
-	user, ok := counters[creds.Username]
-	if !ok || user.Password != creds.Password {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
+    if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+        log.Printf("Failed to decode login request: %v", err)
+        http.Error(w, "Invalid request format", http.StatusBadRequest)
+        return
+    }
 
-	role := RoleCounter
-	if creds.Username == "admin" {
-		role = RoleAdmin
-	}
+    if creds.Username == "" || creds.Password == "" {
+        log.Printf("Empty username or password in login request")
+        http.Error(w, "Username and password are required", http.StatusBadRequest)
+        return
+    }
 
-	exp := time.Now().Add(24 * time.Hour)
-	claims := &Claims{
-		Username: creds.Username,
-		Role:     role,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(exp),
-		},
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signed, _ := token.SignedString(jwtKey)
+    if redisClient == nil {
+        log.Println("Redis client is not initialized")
+        http.Error(w, "Server error: database not initialized", http.StatusInternalServerError)
+        return
+    }
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "auth_token",
-		Value:    signed,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteNoneMode,
-		Secure: true,
-		
-	})
-	
-	json.NewEncoder(w).Encode(map[string]string{"message": "login success", "role": claims.Role})
+    userJSON, err := redisClient.Get(ctx, fmt.Sprintf("counter:%s", creds.Username)).Result()
+    if err == redis.Nil {
+        log.Printf("User %s not found in Redis", creds.Username)
+        http.Error(w, "Unauthorized: invalid username or password", http.StatusUnauthorized)
+        return
+    } else if err != nil {
+        log.Printf("Redis error fetching user %s: %v", creds.Username, err)
+        http.Error(w, "Server error", http.StatusInternalServerError)
+        return
+    }
+
+    var user Counter
+    if err := json.Unmarshal([]byte(userJSON), &user); err != nil {
+        log.Printf("Error unmarshaling user %s: %v", creds.Username, err)
+        http.Error(w, "Server error", http.StatusInternalServerError)
+        return
+    }
+
+    if user.Password != creds.Password {
+        log.Printf("Password mismatch for user %s", creds.Username)
+        http.Error(w, "Unauthorized: invalid username or password", http.StatusUnauthorized)
+        return
+    }
+
+    role := RoleCounter
+    if creds.Username == "admin" {
+        role = RoleAdmin
+    }
+
+    exp := time.Now().Add(24 * time.Hour)
+    claims := &Claims{
+        Username: creds.Username,
+        Role:     role,
+        RegisteredClaims: jwt.RegisteredClaims{
+            ExpiresAt: jwt.NewNumericDate(exp),
+        },
+    }
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    signed, err := token.SignedString(jwtKey)
+    if err != nil {
+        log.Printf("Error signing JWT for user %s: %v", creds.Username, err)
+        http.Error(w, "Server error", http.StatusInternalServerError)
+        return
+    }
+
+    http.SetCookie(w, &http.Cookie{
+        Name:     "auth_token",
+        Value:    signed,
+        Path:     "/",
+        HttpOnly: true,
+        SameSite: http.SameSiteNoneMode,
+        Secure:   true,
+    })
+
+    json.NewEncoder(w).Encode(map[string]string{"message": "login success", "role": claims.Role})
 }
 
 func createCounter(w http.ResponseWriter, r *http.Request) {
@@ -152,22 +227,30 @@ func createCounter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	
 	if input.Username == "" || input.Password == "" {
 		http.Error(w, "Username and password are required", http.StatusBadRequest)
 		return
 	}
 
-	if _, exists := counters[input.Username]; exists {
+	// Check if counter exists
+	key := fmt.Sprintf("counter:%s", input.Username)
+	exists, _ := redisClient.Exists(ctx, key).Result()
+	if exists > 0 {
 		http.Error(w, "Counter already exists", http.StatusBadRequest)
 		return
 	}
 
-	counters[input.Username] = &Counter{Username: input.Username, Password: input.Password}
-	
+	// Store new counter
+	newCounter := Counter{Username: input.Username, Password: input.Password}
+	counterJSON, _ := json.Marshal(newCounter)
+	if err := redisClient.Set(ctx, key, counterJSON, 0).Err(); err != nil {
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+
+	updateState()
 	json.NewEncoder(w).Encode(map[string]string{"message": "Counter created"})
 }
-
 
 func deleteCounter(w http.ResponseWriter, r *http.Request) {
 	username := r.URL.Query().Get("username")
@@ -175,8 +258,14 @@ func deleteCounter(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid username", http.StatusBadRequest)
 		return
 	}
-	delete(counters, username)
-	
+
+	key := fmt.Sprintf("counter:%s", username)
+	if _, err := redisClient.Del(ctx, key).Result(); err != nil {
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+
+	updateState()
 	json.NewEncoder(w).Encode(map[string]string{"message": "Counter deleted"})
 }
 
@@ -192,56 +281,108 @@ func updateCounter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate input
 	if input.OldUsername == "" || input.NewUsername == "" || input.Password == "" {
 		http.Error(w, "Old username, new username, and password are required", http.StatusBadRequest)
 		return
 	}
 
-	// Prevent admin account modification
 	if input.OldUsername == "admin" {
 		http.Error(w, "Cannot modify admin account", http.StatusForbidden)
 		return
 	}
 
-	// Check if old username exists
-	counter, exists := counters[input.OldUsername]
-	if !exists {
+	oldKey := fmt.Sprintf("counter:%s", input.OldUsername)
+	newKey := fmt.Sprintf("counter:%s", input.NewUsername)
+
+	// Fetch existing counter
+	userJSON, err := redisClient.Get(ctx, oldKey).Result()
+	if err == redis.Nil {
 		http.Error(w, "Counter not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, "Server error", http.StatusInternalServerError)
 		return
 	}
 
-	// If new username is different and already exists, prevent duplication
+	var counter Counter
+	if err := json.Unmarshal([]byte(userJSON), &counter); err != nil {
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Check for new username conflict
 	if input.NewUsername != input.OldUsername {
-		if _, exists := counters[input.NewUsername]; exists {
+		exists, _ := redisClient.Exists(ctx, newKey).Result()
+		if exists > 0 {
 			http.Error(w, "New username already exists", http.StatusBadRequest)
 			return
 		}
-		// Update username by removing old entry and creating new one
-		delete(counters, input.OldUsername)
-		counters[input.NewUsername] = &Counter{
-			Username: input.NewUsername,
-			Password: input.Password,
-			Count:    counter.Count, // Preserve the count
-		}
-	} else {
-		// If usernames are the same, only update password
-		counter.Password = input.Password
 	}
 
-	
+	// Update counter
+	updatedCounter := Counter{
+		Username: input.NewUsername,
+		Password: input.Password,
+		Count:    counter.Count,
+	}
+	updatedJSON, _ := json.Marshal(updatedCounter)
+
+	// Use a transaction to ensure atomicity
+	pipe := redisClient.TxPipeline()
+	if input.NewUsername != input.OldUsername {
+		pipe.Del(ctx, oldKey)
+	}
+	pipe.Set(ctx, newKey, updatedJSON, 0)
+	if _, err := pipe.Exec(ctx); err != nil {
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+
+	updateState()
 	json.NewEncoder(w).Encode(map[string]string{"message": "Counter updated"})
 }
 
 func listCounters(w http.ResponseWriter, r *http.Request) {
+	// Get all keys matching "counter:*"
+	keys, err := redisClient.Keys(ctx, "counter:*").Result()
+	if err != nil {
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+
+	counters := make(map[string]*Counter)
+	for _, key := range keys {
+		userJSON, err := redisClient.Get(ctx, key).Result()
+		if err != nil {
+			continue
+		}
+		var counter Counter
+		if err := json.Unmarshal([]byte(userJSON), &counter); err != nil {
+			continue
+		}
+		username := counter.Username
+		counters[username] = &counter
+	}
+
 	json.NewEncoder(w).Encode(counters)
 }
 
 func incrementCounter(w http.ResponseWriter, r *http.Request) {
 	user := r.Header.Get("X-User")
-	counter, ok := counters[user]
-	if !ok {
+	key := fmt.Sprintf("counter:%s", user)
+
+	userJSON, err := redisClient.Get(ctx, key).Result()
+	if err == redis.Nil {
 		http.Error(w, "User not found", http.StatusNotFound)
+		return
+	} else if err != nil {
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+
+	var counter Counter
+	if err := json.Unmarshal([]byte(userJSON), &counter); err != nil {
+		http.Error(w, "Server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -255,21 +396,16 @@ func incrementCounter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	counter.Count = input.Count
-	
+	updatedJSON, _ := json.Marshal(counter)
+	if err := redisClient.Set(ctx, key, updatedJSON, 0).Err(); err != nil {
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+
+	updateState()
 	json.NewEncoder(w).Encode(map[string]int{"count": counter.Count})
 }
 
-func resetCounter(w http.ResponseWriter, r *http.Request) {
-	user := r.Header.Get("X-User")
-	counter, ok := counters[user]
-	if !ok {
-		http.Error(w, "User not found", http.StatusNotFound)
-		return
-	}
-	counter.Count = 0
-	json.NewEncoder(w).Encode(map[string]int{"count": counter.Count})
-	
-}
 
 // ===== Long Polling Handler =====
 func pollHandler(w http.ResponseWriter, r *http.Request) {
@@ -279,6 +415,7 @@ func pollHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-timeout:
+			counters := make(map[string]*Counter)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"version": time.Unix(0, stateVersion).Format(time.RFC3339Nano),
@@ -288,6 +425,7 @@ func pollHandler(w http.ResponseWriter, r *http.Request) {
 		default:
 			currentTime := time.Unix(0, stateVersion)
 			if lastVersion.Before(currentTime) {
+				counters := make(map[string]*Counter)
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(map[string]interface{}{
 					"version": currentTime.Format(time.RFC3339Nano),
@@ -302,6 +440,17 @@ func pollHandler(w http.ResponseWriter, r *http.Request) {
 
 func updateState() {
 	stateVersion = time.Now().UnixNano()
+	keys, _ := redisClient.Keys(ctx, "counter:*").Result()
+	counters := make(map[string]*Counter)
+	for _, key := range keys {
+		userJSON, err := redisClient.Get(ctx, key).Result()
+		if err == nil {
+			var counter Counter
+			if err := json.Unmarshal([]byte(userJSON), &counter); err == nil {
+				counters[counter.Username] = &counter
+			}
+		}
+	}
 	state, _ := json.Marshal(counters)
 	stateCache = state
 }
@@ -309,7 +458,7 @@ func updateState() {
 // ===== MAIN =====
 func main() {
 	
-
+	initRedis()
 	mux := http.NewServeMux()
 
 	// Public
@@ -324,7 +473,6 @@ func main() {
 
 	// Counter
 	mux.HandleFunc("/api/counter/increment", authMiddleware(incrementCounter, RoleCounter))
-	mux.HandleFunc("/api/counter/reset", authMiddleware(resetCounter, RoleCounter))
 
 
 	fmt.Println("Server running on http://localhost:4000")
